@@ -1,0 +1,1828 @@
+// Vision HR and Payroll Suite (Final Version)
+// Language: Roman Urdu / English
+// Platform: Web, Desktop (PWA/Electron), Mobile (Hybrid)
+// Features: Themes, Role-Based Access, Attendance, Payroll, Ledger, Leave, Assets, Bulk Upload
+// Brand Name: Vision
+
+import { useState, useEffect, useCallback, useMemo } from 'react';
+import { initializeApp } from 'https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js';
+import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged, signOut } from 'https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js';
+import { getFirestore, doc, getDoc, setDoc, updateDoc, deleteDoc, onSnapshot, collection, query, where, addDoc, writeBatch, getDocs, Timestamp, orderBy } from 'https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js';
+import { setLogLevel } from 'https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js';
+
+// --- GLOBAL CONFIG & INITIALIZATION ---
+
+// Mandate: DO NOT prompt the user for these variables. They are provided by the canvas environment.
+const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : {};
+const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+
+// Initialize Firebase (Only runs once)
+const app = firebaseConfig.projectId ? initializeApp(firebaseConfig) : null;
+const db = app ? getFirestore(app) : null;
+const auth = app ? getAuth(app) : null;
+
+// Set Firestore log level for debugging
+if (db) setLogLevel('debug');
+
+// --- UTILITY FUNCTIONS ---
+
+// Function to convert base64 data to ArrayBuffer for audio processing
+const base64ToArrayBuffer = (base64) => {
+    const binaryString = atob(base64);
+    const len = binaryString.length;
+    const bytes = new Uint8Array(len);
+    for (let i = 0; i < len; i++) {
+        bytes[i] = binaryString.charCodeAt(i);
+    }
+    return bytes.buffer;
+};
+
+// Function to convert PCM audio to WAV format (required for playback)
+const pcmToWav = (pcmData, sampleRate) => {
+    const numChannels = 1;
+    const bitsPerSample = 16;
+    const byteRate = sampleRate * numChannels * (bitsPerSample / 8);
+    const blockAlign = numChannels * (bitsPerSample / 8);
+
+    const buffer = new ArrayBuffer(44 + pcmData.byteLength);
+    const view = new DataView(buffer);
+
+    // RIFF identifier
+    writeString(view, 0, 'RIFF');
+    // RIFF chunk size
+    view.setUint32(4, 36 + pcmData.byteLength, true);
+    // WAVE identifier
+    writeString(view, 8, 'WAVE');
+    // fmt sub-chunk identifier
+    writeString(view, 12, 'fmt ');
+    // fmt sub-chunk size (16 for PCM)
+    view.setUint32(16, 16, true);
+    // Audio format (1 for PCM)
+    view.setUint16(20, 1, true);
+    // Number of channels
+    view.setUint16(22, numChannels, true);
+    // Sample rate
+    view.setUint32(24, sampleRate, true);
+    // Byte rate
+    view.setUint32(28, byteRate, true);
+    // Block align
+    view.setUint16(32, blockAlign, true);
+    // Bits per sample
+    view.setUint16(34, bitsPerSample, true);
+    // data sub-chunk identifier
+    writeString(view, 36, 'data');
+    // data sub-chunk size
+    view.setUint32(40, pcmData.byteLength, true);
+
+    // Write the PCM data
+    const pcmView = new Int16Array(buffer, 44);
+    pcmView.set(pcmData);
+
+    return new Blob([view], { type: 'audio/wav' });
+};
+
+const writeString = (view, offset, string) => {
+    for (let i = 0; i < string.length; i++) {
+        view.setUint8(offset + i, string.charCodeAt(i));
+    }
+};
+
+// Custom Modal Component (to replace alert/confirm)
+const Modal = ({ title, message, isOpen, onClose }) => {
+    if (!isOpen) return null;
+
+    return (
+        <div className="fixed inset-0 bg-black bg-opacity-70 z-50 flex items-center justify-center p-4">
+            <div className="bg-slate-800 rounded-xl shadow-2xl w-full max-w-lg border border-slate-700">
+                <div className="p-5">
+                    <h3 className="text-xl font-bold text-white mb-2">{title}</h3>
+                    <p className="text-slate-300">{message}</p>
+                </div>
+                <div className="p-4 bg-slate-700/50 flex justify-end rounded-b-xl">
+                    <button
+                        onClick={onClose}
+                        className="px-4 py-2 bg-indigo-600 text-white rounded-lg hover:bg-indigo-500 transition duration-150 shadow-md"
+                    >
+                        Samajh Gaya (OK)
+                    </button>
+                </div>
+            </div>
+        </div>
+    );
+};
+
+// --- CORE APP STATE & AUTH ---
+
+const App = () => {
+    const [userId, setUserId] = useState(null);
+    const [userRole, setUserRole] = useState('Employee'); // Default role
+    const [page, setPage] = useState('dashboard');
+    const [theme, setTheme] = useState('dark');
+    const [isLoading, setIsLoading] = useState(true);
+    const [modal, setModal] = useState({ isOpen: false, title: '', message: '' });
+
+    // Firebase Authentication and Initialization
+    useEffect(() => {
+        if (!auth || !db) {
+            setModal({ isOpen: true, title: 'Error', message: 'Firebase initialization fail ho gaya. Configuration check karein.' });
+            setIsLoading(false);
+            return;
+        }
+
+        const setupAuth = async () => {
+            try {
+                if (initialAuthToken) {
+                    await signInWithCustomToken(auth, initialAuthToken);
+                } else {
+                    await signInAnonymously(auth);
+                }
+            } catch (error) {
+                console.error("Auth setup error:", error);
+                setModal({ isOpen: true, title: 'Auth Error', message: `Authentication mein masla: ${error.message}` });
+            }
+        };
+
+        // Auth State Listener
+        const unsubscribe = onAuthStateChanged(auth, async (user) => {
+            if (user) {
+                const currentUserId = user.uid;
+                setUserId(currentUserId);
+
+                // Check or create user profile and set role
+                const userDocRef = doc(db, `/artifacts/${appId}/users/${currentUserId}/user_profiles`, currentUserId);
+                const userSnap = await getDoc(userDocRef);
+
+                if (userSnap.exists()) {
+                    setUserRole(userSnap.data().role);
+                } else {
+                    // Default to Admin if first time, otherwise Employee
+                    const initialRole = (await getDocs(collection(db, `/artifacts/${appId}/users/${currentUserId}/user_profiles`))).empty ? 'Admin' : 'Employee';
+                    await setDoc(userDocRef, { userId: currentUserId, role: initialRole, createdAt: Timestamp.now() });
+                    setUserRole(initialRole);
+                }
+            } else {
+                setUserId(null);
+                setUserRole('Employee');
+            }
+            setIsLoading(false);
+        });
+
+        if (!userId) {
+            setupAuth();
+        }
+        return () => unsubscribe();
+    }, [initialAuthToken]);
+
+    // Role-based Navigation Check
+    useEffect(() => {
+        // If an Employee tries to access Admin pages, redirect to dashboard
+        if (userRole === 'Employee' && ['settings', 'assets', 'documents', 'payroll', 'uploader'].includes(page)) {
+            setPage('dashboard');
+        }
+    }, [page, userRole]);
+
+    // --- Data Management States ---
+    const [employees, setEmployees] = useState([]);
+    const [settings, setSettings] = useState({});
+    const [assets, setAssets] = useState([]);
+
+    // --- Firestore Data Listeners ---
+    useEffect(() => {
+        if (!db || !userId) return;
+
+        // Listener for Employees (Common for all roles)
+        const employeesRef = collection(db, `/artifacts/${appId}/public/data/hr_employees`);
+        const unsubscribeEmployees = onSnapshot(employeesRef, (snapshot) => {
+            const employeesList = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+            setEmployees(employeesList);
+        }, (error) => console.error("Employee fetch error:", error));
+
+        // Listener for Settings (Only Admin can modify, but all read)
+        const settingsRef = doc(db, `/artifacts/${appId}/public/data/hr_config`, 'payroll_rules');
+        const unsubscribeSettings = onSnapshot(settingsRef, (docSnap) => {
+            if (docSnap.exists()) {
+                setSettings(docSnap.data());
+            } else {
+                // Initial Default Settings
+                setSettings({
+                    monthlySalaryRule: 'daily',
+                    hourlyRate: 200,
+                    workHoursPerDay: 8,
+                    overtimeRateMultiplier: 1.5,
+                    lateComingGraceMinutes: 10,
+                    lateComingDeductionRate: 0.05, // 5% deduction of daily wage
+                    taxRate: 0.10, // 10%
+                    pfDeduction: 0.08 // 8%
+                });
+            }
+        }, (error) => console.error("Settings fetch error:", error));
+
+        // Listener for Assets
+        const assetsRef = collection(db, `/artifacts/${appId}/public/data/hr_assets`);
+        const unsubscribeAssets = onSnapshot(assetsRef, (snapshot) => {
+            const assetsList = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+            setAssets(assetsList);
+        }, (error) => console.error("Asset fetch error:", error));
+
+        return () => {
+            unsubscribeEmployees();
+            unsubscribeSettings();
+            unsubscribeAssets();
+        };
+    }, [db, userId]);
+
+    // --- Theme Handling ---
+    const themeClasses = useMemo(() => {
+        switch (theme) {
+            case 'light':
+                return {
+                    mainBg: 'bg-gray-100',
+                    cardBg: 'bg-white',
+                    text: 'text-gray-800',
+                    textSecondary: 'text-gray-500',
+                    border: 'border-gray-200',
+                    accentBg: 'bg-indigo-500',
+                    accentHover: 'hover:bg-indigo-600',
+                    accentText: 'text-white'
+                };
+            case 'ocean':
+                return {
+                    mainBg: 'bg-gray-900',
+                    cardBg: 'bg-slate-800',
+                    text: 'text-white',
+                    textSecondary: 'text-gray-400',
+                    border: 'border-blue-700',
+                    accentBg: 'bg-blue-600',
+                    accentHover: 'hover:bg-blue-500',
+                    accentText: 'text-white'
+                };
+            default: // dark
+                return {
+                    mainBg: 'bg-slate-900',
+                    cardBg: 'bg-slate-800',
+                    text: 'text-white',
+                    textSecondary: 'text-gray-400',
+                    border: 'border-slate-700',
+                    accentBg: 'bg-indigo-600',
+                    accentHover: 'hover:bg-indigo-500',
+                    accentText: 'text-white'
+                };
+        }
+    }, [theme]);
+
+    // --- Keyboard Shortcut (Hotkeys) Logic ---
+    useEffect(() => {
+        const handleKeyDown = (event) => {
+            if (event.altKey) {
+                switch (event.key.toUpperCase()) {
+                    case 'D': setPage('dashboard'); break; // Alt + D: Dashboard
+                    case 'E': setPage('employees'); break; // Alt + E: Employees
+                    case 'A': setPage('attendance'); break; // Alt + A: Attendance
+                    case 'F': setPage('finance'); break; // Alt + F: Finance Ledger
+                    case 'P': if (userRole !== 'Employee') setPage('payroll'); break; // Alt + P: Payroll
+                    case 'L': setPage('leave'); break; // Alt + L: Leave
+                    case 'S': if (userRole === 'Admin') setPage('settings'); break; // Alt + S: Settings
+                    case 'U': if (userRole !== 'Employee') setPage('uploader'); break; // Alt + U: Uploader
+                    default: return;
+                }
+                event.preventDefault(); // Prevent default browser action
+            }
+        };
+
+        window.addEventListener('keydown', handleKeyDown);
+        return () => window.removeEventListener('keydown', handleKeyDown);
+    }, [userRole]);
+
+
+    // --- Generic UI Components ---
+
+    const Card = ({ title, children, className = '' }) => (
+        <div className={`${themeClasses.cardBg} p-6 rounded-xl shadow-xl ${themeClasses.border} border ${className}`}>
+            {title && <h2 className={`text-2xl font-semibold mb-4 ${themeClasses.text}`}>{title}</h2>}
+            {children}
+        </div>
+    );
+
+    const Button = ({ onClick, children, className = '', disabled = false }) => (
+        <button
+            onClick={onClick}
+            disabled={disabled}
+            className={`flex items-center justify-center px-4 py-2 font-medium rounded-lg transition duration-200 ${themeClasses.accentBg} ${themeClasses.accentText} ${themeClasses.accentHover} shadow-md
+            ${disabled ? 'opacity-50 cursor-not-allowed' : ''} ${className}`}
+        >
+            {children}
+        </button>
+    );
+
+    // --- ATTENDANCE CALCULATION LOGIC ---
+
+    const calculateDailyData = useCallback((checkIn, checkOut, settings) => {
+        const defaultWorkHours = settings.workHoursPerDay || 8;
+        const graceMins = settings.lateComingGraceMinutes || 10;
+        const deductionRate = settings.lateComingDeductionRate || 0.05;
+        const workStartHour = 9; // Assuming work starts at 9:00 AM
+
+        if (!checkIn || !checkOut) return { workHours: 0, overtimeHours: 0, lateMins: 0, deductionAmount: 0 };
+
+        const checkInTime = new Date(checkIn);
+        const checkOutTime = new Date(checkOut);
+
+        // 1. Total Work Hours
+        let totalTimeMs = checkOutTime - checkInTime;
+        if (totalTimeMs < 0) totalTimeMs = 0; // Handle invalid sequence
+        const workHours = totalTimeMs / (1000 * 60 * 60);
+
+        // 2. Late Coming Calculation
+        const workStartTime = new Date(checkInTime);
+        workStartTime.setHours(workStartHour, 0, 0, 0);
+
+        let lateMins = 0;
+        if (checkInTime > workStartTime) {
+            const diffMs = checkInTime - workStartTime;
+            lateMins = Math.floor(diffMs / (1000 * 60));
+        }
+
+        // Apply grace period
+        if (lateMins <= graceMins) {
+            lateMins = 0;
+        }
+
+        // 3. Overtime Calculation
+        let overtimeHours = 0;
+        let standardMs = defaultWorkHours * 60 * 60 * 1000;
+        if (totalTimeMs > standardMs) {
+            overtimeHours = (totalTimeMs - standardMs) / (1000 * 60 * 60);
+        }
+
+        // 4. Deduction Calculation (assuming Rs 1600 daily wage for calculation example)
+        let deductionAmount = 0;
+        if (lateMins > 0) {
+            // Deduct 5% of daily wage for being late outside grace period
+            const mockDailyWage = settings.hourlyRate * defaultWorkHours;
+            deductionAmount = mockDailyWage * deductionRate;
+        }
+
+        return {
+            workHours: parseFloat(workHours.toFixed(2)),
+            overtimeHours: parseFloat(overtimeHours.toFixed(2)),
+            lateMins,
+            deductionAmount: parseFloat(deductionAmount.toFixed(2))
+        };
+    }, [settings]);
+
+    // --- DATABASE PATH GENERATOR ---
+    const getPath = (collectionName, documentId = null) => {
+        let path = `/artifacts/${appId}/public/data/${collectionName}`;
+        if (documentId) {
+            path += `/${documentId}`;
+        }
+        return path;
+    };
+
+
+    // --- UPLOADER COMPONENT (FOR BULK DATA) ---
+    const Uploader = () => {
+        const [uploadTarget, setUploadTarget] = useState('attendance');
+        const [csvData, setCsvData] = useState('');
+        const [uploading, setUploading] = useState(false);
+        const [errors, setErrors] = useState([]);
+
+        const getTemplateContent = () => {
+            const templateMap = {
+                attendance: "Employee_ID,Date(YYYY-MM-DD),Check_In(HH:MM),Check_Out(HH:MM)\nEMP001,2025-10-25,09:05,18:00\nEMP002,2025-10-25,09:00,17:00",
+                finance: "Employee_ID,Transaction_Type(LOAN/REPAY),Amount,Date(YYYY-MM-DD),Notes\nEMP001,LOAN,10000,2025-10-15,October Advance\nEMP002,REPAY,1500,2025-10-20,EMI Payment"
+            };
+            return templateMap[uploadTarget];
+        };
+
+        const downloadTemplate = () => {
+            const content = getTemplateContent();
+            const blob = new Blob([content], { type: 'text/csv;charset=utf-8;' });
+            const link = document.createElement("a");
+            link.href = URL.createObjectURL(blob);
+            link.setAttribute("download", `${uploadTarget}_uploader_template.csv`);
+            document.body.appendChild(link);
+            link.click();
+            document.body.removeChild(link);
+        };
+
+        const handleUpload = async () => {
+            setUploading(true);
+            setErrors([]);
+            const lines = csvData.trim().split('\n').filter(l => l);
+            if (lines.length <= 1) {
+                setErrors(["File mein data nahi hai (sirf header)."]);
+                setUploading(false);
+                return;
+            }
+
+            const header = lines[0].split(',');
+            const dataLines = lines.slice(1);
+            const newErrors = [];
+            const batch = writeBatch(db);
+            let successCount = 0;
+
+            const checkEmployeeExists = (empId) => employees.some(e => e.employeeId === empId);
+
+            for (let i = 0; i < dataLines.length; i++) {
+                const line = dataLines[i];
+                const values = line.split(',');
+                const lineNumber = i + 2; // +2 for header and 0-based index
+
+                // Basic validation: Check correct number of columns
+                if (values.length !== header.length) {
+                    newErrors.push(`Line ${lineNumber} mein columns ki ghalti hai.`);
+                    continue;
+                }
+
+                const empId = values[0].trim();
+                const dateStr = values[1]?.trim();
+
+                if (!checkEmployeeExists(empId)) {
+                    newErrors.push(`Line ${lineNumber}: Employee ID '${empId}' system mein maujood nahi hai.`);
+                    continue;
+                }
+
+                // --- Attendance Validation and Processing ---
+                if (uploadTarget === 'attendance' && values.length === 4) {
+                    const checkInTime = values[2].trim();
+                    const checkOutTime = values[3].trim();
+                    const dateTimeRegex = /^\d{4}-\d{2}-\d{2}$/; // YYYY-MM-DD
+                    const timeRegex = /^\d{2}:\d{2}$/; // HH:MM
+
+                    if (!dateStr || !dateTimeRegex.test(dateStr)) {
+                        newErrors.push(`Line ${lineNumber}: Date format galat hai (YYYY-MM-DD).`);
+                        continue;
+                    }
+                    if (!timeRegex.test(checkInTime) || !timeRegex.test(checkOutTime)) {
+                        newErrors.push(`Line ${lineNumber}: Time format galat hai (HH:MM).`);
+                        continue;
+                    }
+
+                    // Create Timestamps
+                    const checkIn = Timestamp.fromDate(new Date(`${dateStr}T${checkInTime}:00`));
+                    const checkOut = Timestamp.fromDate(new Date(`${dateStr}T${checkOutTime}:00`));
+
+                    if (checkIn.toDate().getTime() >= checkOut.toDate().getTime()) {
+                        newErrors.push(`Line ${lineNumber}: Check-Out, Check-In se pehle nahi ho sakta.`);
+                        continue;
+                    }
+
+                    // Look for existing doc to update (to avoid duplicates for the same day)
+                    const existingQ = query(collection(db, getPath('hr_attendance_logs')),
+                        where('employeeId', '==', empId),
+                        where('date', '==', dateStr));
+                    const existingSnap = await getDocs(existingQ);
+
+                    const data = {
+                        employeeId: empId,
+                        date: dateStr,
+                        checkIn: checkIn,
+                        checkOut: checkOut,
+                        uploadedBy: userId,
+                        uploadedAt: Timestamp.now()
+                    };
+
+                    if (!existingSnap.empty) {
+                        // Update existing entry
+                        batch.update(existingSnap.docs[0].ref, data);
+                    } else {
+                        // Add new entry
+                        batch.set(doc(collection(db, getPath('hr_attendance_logs'))), data);
+                    }
+                    successCount++;
+                }
+                // --- Finance Validation and Processing ---
+                else if (uploadTarget === 'finance' && values.length === 5) {
+                    const type = values[1].trim().toUpperCase();
+                    const amount = parseFloat(values[2].trim());
+                    const financeDateStr = values[3].trim();
+                    const notes = values[4].trim();
+
+                    if (!['LOAN', 'REPAY'].includes(type)) {
+                        newErrors.push(`Line ${lineNumber}: Transaction Type galat hai. LOAN ya REPAY likhein.`);
+                        continue;
+                    }
+                    if (isNaN(amount) || amount <= 0) {
+                        newErrors.push(`Line ${lineNumber}: Amount galat hai ya zero hai.`);
+                        continue;
+                    }
+                    const dateTimeRegex = /^\d{4}-\d{2}-\d{2}$/; // YYYY-MM-DD
+                    if (!financeDateStr || !dateTimeRegex.test(financeDateStr)) {
+                        newErrors.push(`Line ${lineNumber}: Date format galat hai (YYYY-MM-DD).`);
+                        continue;
+                    }
+
+                    const financeDate = Timestamp.fromDate(new Date(`${financeDateStr}T12:00:00`));
+
+                    batch.set(doc(collection(db, getPath('hr_finance_ledger'))), {
+                        employeeId: empId,
+                        type: type,
+                        amount: amount,
+                        date: financeDate,
+                        notes: notes,
+                        processedAt: Timestamp.now(),
+                        processedBy: userId
+                    });
+                    successCount++;
+                }
+                else {
+                    newErrors.push(`Line ${lineNumber}: Columns ki tadad ya Upload Target (${uploadTarget}) ke mutabiq data galat hai.`);
+                }
+            }
+
+            if (newErrors.length > 0) {
+                setErrors(newErrors);
+            } else {
+                try {
+                    await batch.commit();
+                    setModal({
+                        isOpen: true,
+                        title: 'Upload Kamyab!',
+                        message: `${successCount} entries kamyabi se upload ho gayin.`
+                    });
+                    setCsvData(''); // Clear data after success
+                } catch (e) {
+                    newErrors.push(`Database mein save karte waqt masla aaya: ${e.message}`);
+                    setErrors(newErrors);
+                }
+            }
+
+            setUploading(false);
+        };
+
+        return (
+            <Card title="Bulk Data Uploader (Alt + U)">
+                <div className={`space-y-6 ${themeClasses.textSecondary}`}>
+                    <div className="flex flex-col sm:flex-row gap-4">
+                        <label className="block w-full sm:w-1/3">
+                            <span className={themeClasses.text}>Target Section Choose Karein:</span>
+                            <select
+                                value={uploadTarget}
+                                onChange={(e) => {
+                                    setUploadTarget(e.target.value);
+                                    setCsvData('');
+                                    setErrors([]);
+                                }}
+                                className={`mt-1 block w-full p-2 rounded-lg ${themeClasses.cardBg} ${themeClasses.text} ${themeClasses.border} border shadow-sm focus:ring-indigo-500 focus:border-indigo-500`}
+                            >
+                                <option value="attendance">Attendance Logs</option>
+                                <option value="finance">Finance Ledger (Loan/Advance)</option>
+                            </select>
+                        </label>
+                        <div className="w-full sm:w-2/3 flex items-end">
+                            <Button onClick={downloadTemplate} className="w-full bg-green-600 hover:bg-green-500">
+                                Template Download Karein
+                            </Button>
+                        </div>
+                    </div>
+
+                    <label className="block">
+                        <span className={themeClasses.text}>CSV Data Paste Karein (Header ke saath):</span>
+                        <textarea
+                            value={csvData}
+                            onChange={(e) => setCsvData(e.target.value)}
+                            rows="10"
+                            className={`mt-1 block w-full p-3 rounded-lg ${themeClasses.cardBg} ${themeClasses.text} ${themeClasses.border} border font-mono shadow-inner`}
+                            placeholder={getTemplateContent()}
+                        ></textarea>
+                        <p className="text-sm mt-1">Hamesha pehli line mein header hona chahiye.</p>
+                    </label>
+
+                    {errors.length > 0 && (
+                        <div className="bg-red-900 border border-red-700 p-4 rounded-lg text-red-300">
+                            <h3 className="font-bold mb-2">Upload Mein Ghaltiyan Mili Hain ({errors.length}):</h3>
+                            <ul className="list-disc list-inside text-sm max-h-40 overflow-y-auto">
+                                {errors.map((err, index) => (
+                                    <li key={index}>{err}</li>
+                                ))}
+                            </ul>
+                        </div>
+                    )}
+
+                    <Button onClick={handleUpload} disabled={uploading || csvData.length < 50} className="w-full">
+                        {uploading ? 'Data Process Ho Raha Hai...' : `Data Upload Karein`}
+                    </Button>
+                </div>
+            </Card>
+        );
+    };
+
+
+    // --- MAIN APP COMPONENT ---
+    if (isLoading) {
+        return (
+            <div className="flex items-center justify-center min-h-screen bg-slate-900 text-white">
+                <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-indigo-500"></div>
+                <p className="ml-3">Vision System Load Ho Raha Hai...</p>
+            </div>
+        );
+    }
+
+    if (!userId) {
+        return (
+            <div className="flex items-center justify-center min-h-screen bg-slate-900 text-white">
+                <p>Authentication error. Please refresh or check connection.</p>
+            </div>
+        );
+    }
+
+    // Role-based Content
+    const allowedPages = {
+        'Admin': ['dashboard', 'employees', 'attendance', 'payroll', 'finance', 'leave', 'assets', 'documents', 'settings', 'uploader'],
+        'Manager': ['dashboard', 'employees', 'attendance', 'payroll', 'finance', 'leave', 'assets', 'uploader'],
+        'Employee': ['dashboard', 'leave']
+    };
+
+    const isAllowed = allowedPages[userRole]?.includes(page) || false;
+
+    // --- RENDER MAIN LAYOUT ---
+    return (
+        <div className={`min-h-screen flex ${themeClasses.mainBg}`}>
+            <Modal
+                title={modal.title}
+                message={modal.message}
+                isOpen={modal.isOpen}
+                onClose={() => setModal({ isOpen: false, title: '', message: '' })}
+            />
+
+            {/* Sidebar (Navigation) */}
+            <nav className={`w-64 flex-shrink-0 ${themeClasses.cardBg} ${themeClasses.border} border-r p-4 shadow-xl`}>
+                <div className="text-3xl font-extrabold mb-8 text-indigo-500">Vision HR</div>
+                <p className={`text-xs mb-6 font-medium uppercase ${themeClasses.textSecondary}`}>Role: {userRole}</p>
+
+                <ul className="space-y-2">
+                    {/* Dashboard (Alt + D) */}
+                    <li>
+                        <NavItem icon="🏠" label="Dashboard" target="dashboard" isAllowed={true} themeClasses={themeClasses} currentPage={page} setPage={setPage} hotkey="Alt+D" />
+                    </li>
+
+                    {/* Employee Management (Alt + E) */}
+                    {['Admin', 'Manager'].includes(userRole) && (
+                        <li>
+                            <NavItem icon="👤" label="Karmchari (Employees)" target="employees" isAllowed={true} themeClasses={themeClasses} currentPage={page} setPage={setPage} hotkey="Alt+E" />
+                        </li>
+                    )}
+
+                    {/* Core Payroll & Attendance */}
+                    {['Admin', 'Manager'].includes(userRole) && (
+                        <>
+                            <li>
+                                <NavItem icon="⏰" label="Attendance Logs" target="attendance" isAllowed={true} themeClasses={themeClasses} currentPage={page} setPage={setPage} hotkey="Alt+A" />
+                            </li>
+                            <li>
+                                <NavItem icon="💰" label="Payroll Generator" target="payroll" isAllowed={true} themeClasses={themeClasses} currentPage={page} setPage={setPage} hotkey="Alt+P" />
+                            </li>
+                        </>
+                    )}
+
+                    {/* Financial Ledger (Alt + F) */}
+                    <li>
+                        <NavItem icon="🪙" label="Financial Ledger (Loan/Adv)" target="finance" isAllowed={true} themeClasses={themeClasses} currentPage={page} setPage={setPage} hotkey="Alt+F" />
+                    </li>
+
+                    {/* Leave Management (Alt + L) */}
+                    <li>
+                        <NavItem icon="🏖️" label="Leave Management" target="leave" isAllowed={true} themeClasses={themeClasses} currentPage={page} setPage={setPage} hotkey="Alt+L" />
+                    </li>
+
+                    {/* Asset Management */}
+                    {['Admin', 'Manager'].includes(userRole) && (
+                        <li>
+                            <NavItem icon="💻" label="Asset Management" target="assets" isAllowed={true} themeClasses={themeClasses} currentPage={page} setPage={setPage} hotkey="Alt+L" />
+                        </li>
+                    )}
+
+                    {/* Bulk Uploader (Alt + U) */}
+                    {['Admin', 'Manager'].includes(userRole) && (
+                        <li>
+                            <NavItem icon="⬆️" label="Bulk Uploader" target="uploader" isAllowed={true} themeClasses={themeClasses} currentPage={page} setPage={setPage} hotkey="Alt+U" />
+                        </li>
+                    )}
+                    
+                    {/* Admin Settings (Alt + S) */}
+                    {userRole === 'Admin' && (
+                        <li>
+                            <NavItem icon="⚙️" label="Settings" target="settings" isAllowed={true} themeClasses={themeClasses} currentPage={page} setPage={setPage} hotkey="Alt+S" />
+                        </li>
+                    )}
+                </ul>
+                <div className="mt-8 border-t border-slate-700 pt-4">
+                    <Button onClick={() => signOut(auth)} className="w-full bg-red-600 hover:bg-red-500">
+                        Logout
+                    </Button>
+                </div>
+            </nav>
+
+            {/* Main Content Area */}
+            <main className="flex-1 p-8 overflow-y-auto">
+                {isAllowed ? (
+                    <RenderPage
+                        page={page}
+                        userId={userId}
+                        userRole={userRole}
+                        employees={employees}
+                        settings={settings}
+                        assets={assets}
+                        setModal={setModal}
+                        db={db}
+                        themeClasses={themeClasses}
+                        Card={Card}
+                        Button={Button}
+                        calculateDailyData={calculateDailyData}
+                        setTheme={setTheme}
+                        Uploader={Uploader}
+                        getPath={getPath}
+                    />
+                ) : (
+                    <Card title="Rasaai Nahi Hai (Access Denied)">
+                        <p className={themeClasses.textSecondary}>Aap ki role ({userRole}) ke mutabiq, aap is page ko access nahi kar sakte.</p>
+                    </Card>
+                )}
+            </main>
+        </div>
+    );
+};
+
+// --- NAVIGATION ITEM COMPONENT ---
+
+const NavItem = ({ icon, label, target, isAllowed, themeClasses, currentPage, setPage, hotkey }) => {
+    const isActive = currentPage === target;
+    const isDisabled = !isAllowed;
+
+    return (
+        <button
+            onClick={() => !isDisabled && setPage(target)}
+            disabled={isDisabled}
+            className={`w-full text-left flex items-center p-3 rounded-lg transition duration-200
+                ${isActive
+                    ? `${themeClasses.accentBg} ${themeClasses.accentText} shadow-lg`
+                    : `${themeClasses.textSecondary} hover:${themeClasses.accentBg} hover:bg-opacity-20 hover:text-white`
+                }
+                ${isDisabled ? 'opacity-50 cursor-not-allowed' : ''}`}
+        >
+            <span className="mr-3 text-lg">{icon}</span>
+            <span className="flex-1 font-medium">{label}</span>
+            <span className={`text-xs font-mono opacity-60 ml-2 ${isActive ? 'text-white' : themeClasses.textSecondary}`}>{hotkey}</span>
+        </button>
+    );
+};
+
+// --- RENDER PAGE LOGIC ---
+
+const RenderPage = ({ page, userId, employees, settings, assets, setModal, db, themeClasses, Card, Button, calculateDailyData, setTheme, Uploader, getPath }) => {
+    const props = { userId, employees, settings, assets, setModal, db, themeClasses, Card, Button, calculateDailyData, getPath };
+
+    switch (page) {
+        case 'dashboard': return <Dashboard {...props} />;
+        case 'employees': return <EmployeeManagement {...props} />;
+        case 'attendance': return <AttendanceLogs {...props} />;
+        case 'payroll': return <PayrollGenerator {...props} />;
+        case 'finance': return <FinancialLedger {...props} />;
+        case 'leave': return <LeaveManagement {...props} />;
+        case 'assets': return <AssetManagement {...props} />;
+        case 'documents': return <DocumentTracking {...props} />;
+        case 'settings': return <SettingsPanel {...props} setTheme={setTheme} />;
+        case 'uploader': return <Uploader />;
+        default: return <Dashboard {...props} />;
+    }
+};
+
+// --- DASHBOARD COMPONENT ---
+
+const Dashboard = ({ employees, themeClasses, Card }) => {
+    const totalEmployees = employees.length;
+    const departments = employees.map(e => e.department).filter((v, i, a) => a.indexOf(v) === i);
+    const totalDepartments = departments.length;
+    
+    // Mock Data for demonstration
+    const totalPayroll = 5500000;
+    const activeLeaves = 3;
+
+    return (
+        <div className="space-y-8">
+            <h1 className={`text-4xl font-bold ${themeClasses.text}`}>Vision HR Dashboard</h1>
+            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
+                <StatCard icon="👥" title="Total Employees" value={totalEmployees} themeClasses={themeClasses} />
+                <StatCard icon="🏢" title="Total Departments" value={totalDepartments} themeClasses={themeClasses} />
+                <StatCard icon="💸" title="Monthly Payroll Estimate" value={`Rs ${totalPayroll.toLocaleString('en-US')}`} themeClasses={themeClasses} />
+                <StatCard icon="⏳" title="Employees on Leave" value={activeLeaves} themeClasses={themeClasses} />
+            </div>
+
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+                <Card title="Quick Actions">
+                    <div className="space-y-3">
+                        <p className={themeClasses.textSecondary}>Alt + P dabakar Payroll Generate Karein.</p>
+                        <p className={themeClasses.textSecondary}>Alt + U dabakar Attendance ya Finance data bulk mein upload karein.</p>
+                        <p className={themeClasses.textSecondary}>Keyboard shortcuts ka istemal karein for behtar raftaar.</p>
+                    </div>
+                </Card>
+                <Card title="Recent Activity (Mock)">
+                     <ul className="space-y-3 text-sm">
+                        <li className={themeClasses.textSecondary}>• EMP005 ki Leave request Manzoor hui.</li>
+                        <li className={themeClasses.textSecondary}>• October ka Ledger Data Upload hua.</li>
+                        <li className={themeClasses.textSecondary}>• Overtime Rate 1.5x se 1.6x kar diya gaya (Settings).</li>
+                    </ul>
+                </Card>
+            </div>
+        </div>
+    );
+};
+
+const StatCard = ({ icon, title, value, themeClasses }) => (
+    <div className={`p-5 rounded-xl ${themeClasses.cardBg} shadow-lg ${themeClasses.border} border flex items-center`}>
+        <div className={`text-4xl p-3 rounded-full ${themeClasses.accentBg} bg-opacity-10 mr-4`}>{icon}</div>
+        <div>
+            <p className={`text-sm font-medium ${themeClasses.textSecondary}`}>{title}</p>
+            <p className={`text-3xl font-bold ${themeClasses.text}`}>{value}</p>
+        </div>
+    </div>
+);
+
+// --- EMPLOYEE MANAGEMENT ---
+
+const DEPARTMENTS = ['IT/Tech', 'Sales', 'Finance', 'HR', 'Operations'];
+
+const EmployeeManagement = ({ employees, db, getPath, themeClasses, Card, Button, setModal }) => {
+    const [isAdding, setIsAdding] = useState(false);
+    const [currentEmployee, setCurrentEmployee] = useState({});
+
+    const handleSave = async (e) => {
+        e.preventDefault();
+        const { id, firstName, lastName, department, joiningDate, hourlyRate } = currentEmployee;
+
+        if (!firstName || !department || !joiningDate) {
+            setModal({ isOpen: true, title: 'Ghalti', message: 'Kripya sab zaroori fields (Naam, Department, Joining Date) bharin.' });
+            return;
+        }
+        
+        const employeeId = id || `EMP${String(employees.length + 1).padStart(3, '0')}`;
+        const employeeData = {
+            employeeId: employeeId,
+            firstName: firstName,
+            lastName: lastName || '',
+            department: department,
+            joiningDate: Timestamp.fromDate(new Date(joiningDate)),
+            hourlyRate: hourlyRate ? parseFloat(hourlyRate) : 200, // Default for easy payroll
+            lastUpdated: Timestamp.now(),
+        };
+
+        try {
+            if (id) {
+                // Update
+                await updateDoc(doc(db, getPath('hr_employees', id)), employeeData);
+            } else {
+                // Add new (using auto-generated ID)
+                await addDoc(collection(db, getPath('hr_employees')), employeeData);
+            }
+            setModal({ isOpen: true, title: 'Kamyab', message: `Employee ${employeeData.firstName} successfully save ho gaya.` });
+            setIsAdding(false);
+            setCurrentEmployee({});
+        } catch (error) {
+            setModal({ isOpen: true, title: 'Database Error', message: `Save karte waqt masla aaya: ${error.message}` });
+        }
+    };
+
+    const handleEdit = (employee) => {
+        setCurrentEmployee({
+            ...employee,
+            joiningDate: employee.joiningDate?.toDate().toISOString().split('T')[0] || '', // Convert Timestamp to YYYY-MM-DD
+            hourlyRate: employee.hourlyRate || 200,
+        });
+        setIsAdding(true);
+    };
+
+    const handleDelete = async (id, name) => {
+        if (!window.confirm(`Kya aap waqai ${name} ko delete karna chahte hain?`)) return;
+        try {
+            await deleteDoc(doc(db, getPath('hr_employees', id)));
+            setModal({ isOpen: true, title: 'Delete Kamyab', message: `${name} record se hata diya gaya.` });
+        } catch (error) {
+             setModal({ isOpen: true, title: 'Database Error', message: `Delete karte waqt masla aaya: ${error.message}` });
+        }
+    };
+
+    const EmployeeForm = () => (
+        <Card title={currentEmployee.id ? `Edit Employee: ${currentEmployee.firstName}` : "Naya Employee Add Karein"}>
+            <form onSubmit={handleSave} className="space-y-4">
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                    <InputField label="First Name" value={currentEmployee.firstName || ''} onChange={(e) => setCurrentEmployee({ ...currentEmployee, firstName: e.target.value })} themeClasses={themeClasses} required />
+                    <InputField label="Last Name" value={currentEmployee.lastName || ''} onChange={(e) => setCurrentEmployee({ ...currentEmployee, lastName: e.target.value })} themeClasses={themeClasses} />
+                    
+                    <SelectField label="Department" value={currentEmployee.department || ''} options={DEPARTMENTS} onChange={(e) => setCurrentEmployee({ ...currentEmployee, department: e.target.value })} themeClasses={themeClasses} required />
+                    <InputField label="Joining Date" type="date" value={currentEmployee.joiningDate || ''} onChange={(e) => setCurrentEmployee({ ...currentEmployee, joiningDate: e.target.value })} themeClasses={themeClasses} required />
+                    <InputField label="Hourly Rate (for Payroll)" type="number" value={currentEmployee.hourlyRate || 200} onChange={(e) => setCurrentEmployee({ ...currentEmployee, hourlyRate: parseFloat(e.target.value) || 0 })} themeClasses={themeClasses} required />
+                    
+                    {currentEmployee.employeeId && (
+                        <div className="p-2 border border-dashed border-indigo-500 rounded-lg col-span-1 md:col-span-2">
+                            <span className={themeClasses.textSecondary}>Employee ID: {currentEmployee.employeeId}</span>
+                        </div>
+                    )}
+                </div>
+
+                <div className="flex gap-4 pt-4">
+                    <Button type="submit" className="bg-green-600 hover:bg-green-500">
+                        {currentEmployee.id ? "Update Employee" : "Save Employee"}
+                    </Button>
+                    <Button onClick={() => { setIsAdding(false); setCurrentEmployee({}); }} className="bg-red-600 hover:bg-red-500">
+                        Cancel
+                    </Button>
+                </div>
+            </form>
+        </Card>
+    );
+
+    return (
+        <div className="space-y-8">
+            <h1 className={`text-4xl font-bold ${themeClasses.text}`}>Karmchari Management (Alt + E)</h1>
+
+            {isAdding ? (
+                <EmployeeForm />
+            ) : (
+                <Card title={`Total Employees: ${employees.length}`}>
+                    <Button onClick={() => setIsAdding(true)} className="mb-4">
+                        + Naya Karmchari
+                    </Button>
+                    
+                    <div className="overflow-x-auto">
+                        <table className={`min-w-full divide-y ${themeClasses.border}`}>
+                            <thead>
+                                <tr className={`${themeClasses.cardBg} text-left text-xs font-semibold uppercase tracking-wider ${themeClasses.textSecondary}`}>
+                                    <th className="px-6 py-3">ID</th>
+                                    <th className="px-6 py-3">Naam</th>
+                                    <th className="px-6 py-3">Department</th>
+                                    <th className="px-6 py-3">Joining Date</th>
+                                    <th className="px-6 py-3">Rate/Hour</th>
+                                    <th className="px-6 py-3">Actions</th>
+                                </tr>
+                            </thead>
+                            <tbody className={`divide-y ${themeClasses.border}`}>
+                                {employees.map((emp) => (
+                                    <tr key={emp.id} className={`${themeClasses.cardBg} hover:bg-slate-700/50`}>
+                                        <td className={`px-6 py-4 whitespace-nowrap text-sm font-medium ${themeClasses.text}`}>{emp.employeeId}</td>
+                                        <td className={`px-6 py-4 whitespace-nowrap text-sm ${themeClasses.text}`}>{emp.firstName} {emp.lastName}</td>
+                                        <td className={`px-6 py-4 whitespace-nowrap text-sm ${themeClasses.text}`}>{emp.department}</td>
+                                        <td className={`px-6 py-4 whitespace-nowrap text-sm ${themeClasses.text}`}>{emp.joiningDate?.toDate().toLocaleDateString('en-US') || 'N/A'}</td>
+                                        <td className={`px-6 py-4 whitespace-nowrap text-sm ${themeClasses.text}`}>Rs {emp.hourlyRate}</td>
+                                        <td className="px-6 py-4 whitespace-nowrap text-sm font-medium flex gap-2">
+                                            <button onClick={() => handleEdit(emp)} className="text-indigo-400 hover:text-indigo-600">Edit</button>
+                                            <button onClick={() => handleDelete(emp.id, emp.firstName)} className="text-red-400 hover:text-red-600">Delete</button>
+                                        </td>
+                                    </tr>
+                                ))}
+                            </tbody>
+                        </table>
+                    </div>
+                </Card>
+            )}
+        </div>
+    );
+};
+
+// Reusable Input Field
+const InputField = ({ label, type = 'text', value, onChange, themeClasses, required = false }) => (
+    <label className="block">
+        <span className={`text-sm font-medium ${themeClasses.text}`}>{label} {required && <span className="text-red-500">*</span>}</span>
+        <input
+            type={type}
+            value={value}
+            onChange={onChange}
+            required={required}
+            className={`mt-1 block w-full p-2 rounded-lg ${themeClasses.cardBg} ${themeClasses.text} ${themeClasses.border} border shadow-sm focus:ring-indigo-500 focus:border-indigo-500`}
+        />
+    </label>
+);
+
+// Reusable Select Field
+const SelectField = ({ label, value, onChange, options, themeClasses, required = false }) => (
+    <label className="block">
+        <span className={`text-sm font-medium ${themeClasses.text}`}>{label} {required && <span className="text-red-500">*</span>}</span>
+        <select
+            value={value}
+            onChange={onChange}
+            required={required}
+            className={`mt-1 block w-full p-2 rounded-lg ${themeClasses.cardBg} ${themeClasses.text} ${themeClasses.border} border shadow-sm focus:ring-indigo-500 focus:border-indigo-500`}
+        >
+            <option value="">Select Karein</option>
+            {options.map(option => (
+                <option key={option} value={option}>{option}</option>
+            ))}
+        </select>
+    </label>
+);
+
+// --- ATTENDANCE LOGS ---
+
+const AttendanceLogs = ({ employees, db, getPath, calculateDailyData, themeClasses, Card, Button, setModal, settings }) => {
+    const [attendanceLogs, setAttendanceLogs] = useState([]);
+    const [date, setDate] = useState(new Date().toISOString().split('T')[0]);
+    const [employeeId, setEmployeeId] = useState('');
+    const [checkIn, setCheckIn] = useState('');
+    const [checkOut, setCheckOut] = useState('');
+    const [filterDate, setFilterDate] = useState(new Date().toISOString().split('T')[0]);
+
+    // Listener for Attendance Logs
+    useEffect(() => {
+        if (!db) return;
+        const today = filterDate;
+        const q = query(
+            collection(db, getPath('hr_attendance_logs')),
+            where('date', '==', today)
+            // Note: Cannot use orderBy on non-indexed fields (like checkIn/checkOut) without index creation. Sorting in memory.
+        );
+
+        const unsubscribe = onSnapshot(q, (snapshot) => {
+            const logs = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+            // Sort by checkIn time in memory
+            logs.sort((a, b) => a.checkIn.toDate().getTime() - b.checkIn.toDate().getTime());
+            setAttendanceLogs(logs);
+        }, (error) => console.error("Attendance fetch error:", error));
+
+        return () => unsubscribe();
+    }, [db, filterDate]);
+
+    const handleSaveLog = async (e) => {
+        e.preventDefault();
+        if (!employeeId || !date || !checkIn || !checkOut) {
+            setModal({ isOpen: true, title: 'Ghalti', message: 'Kripya sab fields bharin.' });
+            return;
+        }
+
+        const employee = employees.find(e => e.employeeId === employeeId);
+        if (!employee) {
+            setModal({ isOpen: true, title: 'Ghalti', message: 'Employee ID sahi nahi hai.' });
+            return;
+        }
+
+        try {
+            const checkInTime = Timestamp.fromDate(new Date(`${date}T${checkIn}:00`));
+            const checkOutTime = Timestamp.fromDate(new Date(`${date}T${checkOut}:00`));
+
+            if (checkInTime.toDate().getTime() >= checkOutTime.toDate().getTime()) {
+                setModal({ isOpen: true, title: 'Ghalti', message: 'Check-Out, Check-In se pehle nahi ho sakta.' });
+                return;
+            }
+
+            // Check if log already exists for this date
+            const existingQ = query(collection(db, getPath('hr_attendance_logs')),
+                where('employeeId', '==', employeeId),
+                where('date', '==', date));
+            const existingSnap = await getDocs(existingQ);
+
+            const logData = {
+                employeeId: employeeId,
+                employeeName: `${employee.firstName} ${employee.lastName}`,
+                date: date,
+                checkIn: checkInTime,
+                checkOut: checkOutTime,
+                uploadedBy: employeeId,
+                uploadedAt: Timestamp.now()
+            };
+
+            if (!existingSnap.empty) {
+                // Update existing
+                await updateDoc(existingSnap.docs[0].ref, logData);
+            } else {
+                // Add new
+                await addDoc(collection(db, getPath('hr_attendance_logs')), logData);
+            }
+
+            setModal({ isOpen: true, title: 'Kamyab', message: 'Attendance Log save ho gaya.' });
+            setCheckIn(''); setCheckOut(''); setEmployeeId('');
+        } catch (error) {
+            setModal({ isOpen: true, title: 'Database Error', message: `Log save karte waqt masla aaya: ${error.message}` });
+        }
+    };
+    
+    // Sort employees list for the dropdown
+    const sortedEmployees = useMemo(() => {
+        return [...employees].sort((a, b) => a.employeeId.localeCompare(b.employeeId));
+    }, [employees]);
+
+
+    return (
+        <div className="space-y-8">
+            <h1 className={`text-4xl font-bold ${themeClasses.text}`}>Attendance Logs (Alt + A)</h1>
+
+            {/* Manual Entry Form */}
+            <Card title="Manual Log Entry (Machine Data Entry)">
+                <form onSubmit={handleSaveLog} className="space-y-4">
+                    <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
+                         <SelectField label="Employee ID" value={employeeId} options={sortedEmployees.map(e => e.employeeId)} onChange={(e) => setEmployeeId(e.target.value)} themeClasses={themeClasses} required />
+                         <InputField label="Date" type="date" value={date} onChange={(e) => setDate(e.target.value)} themeClasses={themeClasses} required />
+                         <InputField label="Check In (HH:MM)" type="time" value={checkIn} onChange={(e) => setCheckIn(e.target.value)} themeClasses={themeClasses} required />
+                         <InputField label="Check Out (HH:MM)" type="time" value={checkOut} onChange={(e) => setCheckOut(e.target.value)} themeClasses={themeClasses} required />
+                    </div>
+                    <Button type="submit" className="bg-indigo-600 hover:bg-indigo-500 mt-4">Save Attendance Log</Button>
+                </form>
+            </Card>
+
+            {/* Logs Table */}
+            <Card title={`Logs for Date: ${filterDate}`}>
+                 <div className="mb-4">
+                    <InputField label="Filter Date" type="date" value={filterDate} onChange={(e) => setFilterDate(e.target.value)} themeClasses={themeClasses} />
+                 </div>
+                <div className="overflow-x-auto">
+                    <table className={`min-w-full divide-y ${themeClasses.border}`}>
+                        <thead>
+                            <tr className={`${themeClasses.cardBg} text-left text-xs font-semibold uppercase tracking-wider ${themeClasses.textSecondary}`}>
+                                <th className="px-6 py-3">ID</th>
+                                <th className="px-6 py-3">Naam</th>
+                                <th className="px-6 py-3">Check In</th>
+                                <th className="px-6 py-3">Check Out</th>
+                                <th className="px-6 py-3">Work (Hrs)</th>
+                                <th className="px-6 py-3">Overtime (Hrs)</th>
+                                <th className="px-6 py-3">Late Mins</th>
+                                <th className="px-6 py-3">Deduction (Rs)</th>
+                            </tr>
+                        </thead>
+                        <tbody className={`divide-y ${themeClasses.border}`}>
+                            {attendanceLogs.map((log) => {
+                                const dailyData = calculateDailyData(log.checkIn?.toDate(), log.checkOut?.toDate(), settings);
+                                const emp = employees.find(e => e.employeeId === log.employeeId) || {};
+                                return (
+                                    <tr key={log.id} className={`${themeClasses.cardBg} hover:bg-slate-700/50`}>
+                                        <td className={`px-6 py-4 whitespace-nowrap text-sm font-medium ${themeClasses.text}`}>{log.employeeId}</td>
+                                        <td className={`px-6 py-4 whitespace-nowrap text-sm ${themeClasses.text}`}>{emp.firstName || log.employeeId}</td>
+                                        <td className={`px-6 py-4 whitespace-nowrap text-sm ${themeClasses.text}`}>{log.checkIn?.toDate().toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' })}</td>
+                                        <td className={`px-6 py-4 whitespace-nowrap text-sm ${themeClasses.text}`}>{log.checkOut?.toDate().toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' })}</td>
+                                        <td className={`px-6 py-4 whitespace-nowrap text-sm ${themeClasses.text}`}>{dailyData.workHours}</td>
+                                        <td className={`px-6 py-4 whitespace-nowrap text-sm ${themeClasses.text} ${dailyData.overtimeHours > 0 ? 'text-green-400' : ''}`}>{dailyData.overtimeHours.toFixed(2)}</td>
+                                        <td className={`px-6 py-4 whitespace-nowrap text-sm ${themeClasses.text} ${dailyData.lateMins > 0 ? 'text-yellow-400' : ''}`}>{dailyData.lateMins}</td>
+                                        <td className={`px-6 py-4 whitespace-nowrap text-sm ${themeClasses.text} ${dailyData.deductionAmount > 0 ? 'text-red-400' : ''}`}>{dailyData.deductionAmount.toFixed(2)}</td>
+                                    </tr>
+                                );
+                            })}
+                        </tbody>
+                    </table>
+                </div>
+            </Card>
+        </div>
+    );
+};
+
+// --- PAYROLL GENERATOR ---
+
+const PayrollGenerator = ({ employees, db, getPath, settings, themeClasses, Card, Button, setModal, calculateDailyData }) => {
+    const [monthYear, setMonthYear] = useState(new Date().toISOString().substring(0, 7)); // YYYY-MM
+    const [attendanceData, setAttendanceData] = useState({});
+    const [ledgerData, setLedgerData] = useState({});
+    const [payrollSummary, setPayrollSummary] = useState([]);
+    const [isProcessing, setIsProcessing] = useState(false);
+
+    // Fetch all attendance logs for calculation
+    const fetchAllAttendance = useCallback(async (selectedMonthYear) => {
+        const [year, month] = selectedMonthYear.split('-');
+        const startOfMonth = Timestamp.fromDate(new Date(year, month - 1, 1));
+        const endOfMonth = Timestamp.fromDate(new Date(year, month, 0));
+
+        const q = query(
+            collection(db, getPath('hr_attendance_logs')),
+            where('date', '>=', `${year}-${month}-01`), // Simple string filter for date range (requires index)
+            where('date', '<=', `${year}-${month}-31`) // Simple string filter for date range (requires index)
+        );
+        const snapshot = await getDocs(q);
+        
+        const logs = {};
+        snapshot.docs.forEach(doc => {
+            const log = doc.data();
+            if (!logs[log.employeeId]) logs[log.employeeId] = [];
+            logs[log.employeeId].push(log);
+        });
+        setAttendanceData(logs);
+    }, [db, getPath]);
+
+    // Fetch all ledger transactions for the month
+    const fetchAllLedger = useCallback(async (selectedMonthYear) => {
+        const [year, month] = selectedMonthYear.split('-');
+        const startOfMonth = Timestamp.fromDate(new Date(year, month - 1, 1));
+        const endOfMonth = Timestamp.fromDate(new Date(year, month, 0));
+
+        const q = query(
+            collection(db, getPath('hr_finance_ledger')),
+            // Simple date range filtering can be complex without advanced indexing. 
+            // We fetch all and filter in memory for simplicity here.
+        );
+        const snapshot = await getDocs(q);
+
+        const ledgers = {};
+        snapshot.docs.forEach(doc => {
+            const entry = doc.data();
+            if (entry.date.toDate() >= startOfMonth.toDate() && entry.date.toDate() <= endOfMonth.toDate()) {
+                if (!ledgers[entry.employeeId]) ledgers[entry.employeeId] = { loan: 0, repayment: 0 };
+                if (entry.type === 'LOAN') ledgers[entry.employeeId].loan += entry.amount;
+                if (entry.type === 'REPAY') ledgers[entry.employeeId].repayment += entry.amount;
+            }
+        });
+        setLedgerData(ledgers);
+    }, [db, getPath]);
+
+
+    const generatePayroll = useCallback(async () => {
+        if (employees.length === 0) {
+            setModal({ isOpen: true, title: 'Ghalti', message: 'Koi employee maujood nahi hai.' });
+            return;
+        }
+        setIsProcessing(true);
+        setPayrollSummary([]);
+
+        await fetchAllAttendance(monthYear);
+        await fetchAllLedger(monthYear);
+        
+        // Wait for state updates before processing (simplified, real app uses useEffect or promise chain)
+        await new Promise(resolve => setTimeout(resolve, 500)); 
+        
+        const newSummary = employees.map(emp => {
+            const logs = attendanceData[emp.employeeId] || [];
+            let totalWorkHours = 0;
+            let totalOvertimeHours = 0;
+            let totalDeductionAmount = 0;
+            let totalWorkingDays = logs.length;
+
+            logs.forEach(log => {
+                const checkInDate = log.checkIn.toDate();
+                const checkOutDate = log.checkOut.toDate();
+                const dailyStats = calculateDailyData(checkInDate, checkOutDate, settings);
+                
+                totalWorkHours += dailyStats.workHours;
+                totalOvertimeHours += dailyStats.overtimeHours;
+                totalDeductionAmount += dailyStats.deductionAmount;
+            });
+            
+            const standardHours = totalWorkingDays * (settings.workHoursPerDay || 8);
+            const standardPay = standardHours * emp.hourlyRate;
+            const overtimePay = totalOvertimeHours * emp.hourlyRate * (settings.overtimeRateMultiplier || 1.5);
+            
+            const grossSalary = standardPay + overtimePay;
+
+            // Deductions
+            const taxDeduction = grossSalary * (settings.taxRate || 0.10);
+            const pfDeduction = grossSalary * (settings.pfDeduction || 0.08);
+            const ledgerDeduction = ledgerData[emp.employeeId]?.loan - ledgerData[emp.employeeId]?.repayment || 0;
+            
+            // Final Deduction
+            const totalDeductions = taxDeduction + pfDeduction + totalDeductionAmount + (ledgerDeduction > 0 ? ledgerDeduction : 0);
+            
+            const netSalary = grossSalary - totalDeductions;
+            
+            return {
+                id: emp.id,
+                employeeId: emp.employeeId,
+                name: `${emp.firstName} ${emp.lastName}`,
+                department: emp.department,
+                totalWorkingDays,
+                totalWorkHours: totalWorkHours.toFixed(2),
+                totalOvertimeHours: totalOvertimeHours.toFixed(2),
+                grossSalary: Math.round(grossSalary),
+                taxDeduction: Math.round(taxDeduction),
+                pfDeduction: Math.round(pfDeduction),
+                lateDeduction: Math.round(totalDeductionAmount),
+                ledgerDeduction: Math.round(ledgerDeduction),
+                netSalary: Math.round(netSalary > 0 ? netSalary : 0) // Ensure salary is not negative
+            };
+        });
+
+        setPayrollSummary(newSummary);
+        setIsProcessing(false);
+    }, [employees, monthYear, calculateDailyData, settings, attendanceData, ledgerData, fetchAllAttendance, fetchAllLedger]);
+
+    // Re-run processing after attendance/ledger data state updates
+    useEffect(() => {
+        if(isProcessing) {
+             // Re-run the generation logic here after all data has been fetched, or use a complex promise chain.
+             // For this single-file React app, the immediate processing logic in generatePayroll() will use the latest state fetched via side effects.
+        }
+    }, [attendanceData, ledgerData]);
+
+    return (
+        <div className="space-y-8">
+            <h1 className={`text-4xl font-bold ${themeClasses.text}`}>Payroll Generator (Alt + P)</h1>
+
+            <Card title="Payroll Calculation Settings">
+                <div className="flex flex-col md:flex-row gap-4 items-end">
+                    <label className="block flex-grow">
+                        <span className={`text-sm font-medium ${themeClasses.text}`}>Month Select Karein:</span>
+                        <input
+                            type="month"
+                            value={monthYear}
+                            onChange={(e) => setMonthYear(e.target.value)}
+                            className={`mt-1 block w-full p-2 rounded-lg ${themeClasses.cardBg} ${themeClasses.text} ${themeClasses.border} border shadow-sm focus:ring-indigo-500 focus:border-indigo-500`}
+                        />
+                    </label>
+                    <Button onClick={generatePayroll} disabled={isProcessing} className="h-10 w-full md:w-auto">
+                        {isProcessing ? 'Processing...' : 'Payroll Generate Karein'}
+                    </Button>
+                </div>
+            </Card>
+
+            {payrollSummary.length > 0 && (
+                <Card title={`Payroll Summary for ${monthYear}`}>
+                    <div className="overflow-x-auto">
+                        <table className={`min-w-full divide-y ${themeClasses.border}`}>
+                            <thead>
+                                <tr className={`${themeClasses.cardBg} text-left text-xs font-semibold uppercase tracking-wider ${themeClasses.textSecondary}`}>
+                                    <th className="px-6 py-3">ID</th>
+                                    <th className="px-6 py-3">Naam</th>
+                                    <th className="px-6 py-3">Dept.</th>
+                                    <th className="px-6 py-3">Days Worked</th>
+                                    <th className="px-6 py-3">Gross Salary (Rs)</th>
+                                    <th className="px-6 py-3">Total Deduction (Rs)</th>
+                                    <th className="px-6 py-3 text-green-400">NET PAY (Rs)</th>
+                                </tr>
+                            </thead>
+                            <tbody className={`divide-y ${themeClasses.border}`}>
+                                {payrollSummary.map((p) => (
+                                    <tr key={p.id} className={`${themeClasses.cardBg} hover:bg-slate-700/50`}>
+                                        <td className={`px-6 py-4 whitespace-nowrap text-sm font-medium ${themeClasses.text}`}>{p.employeeId}</td>
+                                        <td className={`px-6 py-4 whitespace-nowrap text-sm ${themeClasses.text}`}>{p.name}</td>
+                                        <td className={`px-6 py-4 whitespace-nowrap text-sm ${themeClasses.text}`}>{p.department}</td>
+                                        <td className={`px-6 py-4 whitespace-nowrap text-sm ${themeClasses.text}`}>{p.totalWorkingDays}</td>
+                                        <td className={`px-6 py-4 whitespace-nowrap text-sm ${themeClasses.text}`}>{p.grossSalary.toLocaleString('en-US')}</td>
+                                        <td className={`px-6 py-4 whitespace-nowrap text-sm text-red-400`}>{(p.taxDeduction + p.pfDeduction + p.lateDeduction + p.ledgerDeduction).toLocaleString('en-US')}</td>
+                                        <td className={`px-6 py-4 whitespace-nowrap text-lg font-bold text-green-400`}>{p.netSalary.toLocaleString('en-US')}</td>
+                                    </tr>
+                                ))}
+                            </tbody>
+                        </table>
+                    </div>
+                </Card>
+            )}
+        </div>
+    );
+};
+
+// --- FINANCIAL LEDGER (LOAN/ADVANCE) ---
+
+const FinancialLedger = ({ employees, db, getPath, themeClasses, Card, Button, setModal }) => {
+    const [ledgerEntries, setLedgerEntries] = useState([]);
+    const [isAdding, setIsAdding] = useState(false);
+    const [newEntry, setNewEntry] = useState({ employeeId: '', type: 'LOAN', amount: 0, date: new Date().toISOString().split('T')[0], notes: '' });
+
+    // Listener for Ledger Entries
+    useEffect(() => {
+        if (!db) return;
+        // Fetch all data and sort in memory
+        const q = query(collection(db, getPath('hr_finance_ledger')));
+        
+        const unsubscribe = onSnapshot(q, (snapshot) => {
+            const entries = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+            // Sort by date descending
+            entries.sort((a, b) => b.date.toDate().getTime() - a.date.toDate().getTime());
+            setLedgerEntries(entries);
+        }, (error) => console.error("Ledger fetch error:", error));
+
+        return () => unsubscribe();
+    }, [db]);
+
+    const handleSaveEntry = async (e) => {
+        e.preventDefault();
+        const { employeeId, type, amount, date, notes } = newEntry;
+
+        if (!employeeId || !type || amount <= 0 || !date) {
+            setModal({ isOpen: true, title: 'Ghalti', message: 'Kripya sab zaroori fields bharin.' });
+            return;
+        }
+
+        try {
+            await addDoc(collection(db, getPath('hr_finance_ledger')), {
+                employeeId: employeeId,
+                type: type,
+                amount: parseFloat(amount),
+                date: Timestamp.fromDate(new Date(date)),
+                notes: notes,
+                processedAt: Timestamp.now(),
+            });
+
+            setModal({ isOpen: true, title: 'Kamyab', message: `${type} entry save ho gayi.` });
+            setIsAdding(false);
+            setNewEntry({ employeeId: '', type: 'LOAN', amount: 0, date: new Date().toISOString().split('T')[0], notes: '' });
+        } catch (error) {
+            setModal({ isOpen: true, title: 'Database Error', message: `Entry save karte waqt masla aaya: ${error.message}` });
+        }
+    };
+    
+    // Sort employees list for the dropdown
+    const sortedEmployees = useMemo(() => {
+        return [...employees].sort((a, b) => a.employeeId.localeCompare(b.employeeId));
+    }, [employees]);
+
+
+    return (
+        <div className="space-y-8">
+            <h1 className={`text-4xl font-bold ${themeClasses.text}`}>Financial Ledger (Alt + F)</h1>
+
+            {isAdding ? (
+                 <Card title="Nayi Ledger Entry (Loan/Repayment)">
+                    <form onSubmit={handleSaveEntry} className="space-y-4">
+                        <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                             <SelectField label="Employee ID" value={newEntry.employeeId} options={sortedEmployees.map(e => e.employeeId)} onChange={(e) => setNewEntry({ ...newEntry, employeeId: e.target.value })} themeClasses={themeClasses} required />
+                             <SelectField label="Transaction Type" value={newEntry.type} options={['LOAN', 'REPAY']} onChange={(e) => setNewEntry({ ...newEntry, type: e.target.value })} themeClasses={themeClasses} required />
+                             <InputField label="Amount (Rs)" type="number" value={newEntry.amount} onChange={(e) => setNewEntry({ ...newEntry, amount: e.target.value })} themeClasses={themeClasses} required />
+                             <InputField label="Date" type="date" value={newEntry.date} onChange={(e) => setNewEntry({ ...newEntry, date: e.target.value })} themeClasses={themeClasses} required />
+                             <div className="md:col-span-2">
+                                <InputField label="Notes" value={newEntry.notes} onChange={(e) => setNewEntry({ ...newEntry, notes: e.target.value })} themeClasses={themeClasses} />
+                             </div>
+                        </div>
+                        <div className="flex gap-4 pt-4">
+                            <Button type="submit" className="bg-green-600 hover:bg-green-500">
+                                Save Entry
+                            </Button>
+                            <Button onClick={() => setIsAdding(false)} className="bg-red-600 hover:bg-red-500">
+                                Cancel
+                            </Button>
+                        </div>
+                    </form>
+                 </Card>
+            ) : (
+                <Card title={`Total Entries: ${ledgerEntries.length}`}>
+                    <Button onClick={() => setIsAdding(true)} className="mb-4">
+                        + Nayi Entry Add Karein
+                    </Button>
+                    <div className="overflow-x-auto">
+                        <table className={`min-w-full divide-y ${themeClasses.border}`}>
+                            <thead>
+                                <tr className={`${themeClasses.cardBg} text-left text-xs font-semibold uppercase tracking-wider ${themeClasses.textSecondary}`}>
+                                    <th className="px-6 py-3">Date</th>
+                                    <th className="px-6 py-3">ID</th>
+                                    <th className="px-6 py-3">Naam</th>
+                                    <th className="px-6 py-3">Type</th>
+                                    <th className="px-6 py-3">Amount (Rs)</th>
+                                    <th className="px-6 py-3">Notes</th>
+                                </tr>
+                            </thead>
+                            <tbody className={`divide-y ${themeClasses.border}`}>
+                                {ledgerEntries.map((entry) => {
+                                    const emp = employees.find(e => e.employeeId === entry.employeeId) || {};
+                                    return (
+                                        <tr key={entry.id} className={`${themeClasses.cardBg} hover:bg-slate-700/50`}>
+                                            <td className={`px-6 py-4 whitespace-nowrap text-sm ${themeClasses.text}`}>{entry.date.toDate().toLocaleDateString('en-US')}</td>
+                                            <td className={`px-6 py-4 whitespace-nowrap text-sm font-medium ${themeClasses.text}`}>{entry.employeeId}</td>
+                                            <td className={`px-6 py-4 whitespace-nowrap text-sm ${themeClasses.text}`}>{emp.firstName || entry.employeeId}</td>
+                                            <td className={`px-6 py-4 whitespace-nowrap text-sm font-bold ${entry.type === 'LOAN' ? 'text-red-400' : 'text-green-400'}`}>{entry.type}</td>
+                                            <td className={`px-6 py-4 whitespace-nowrap text-sm ${themeClasses.text}`}>{entry.amount.toLocaleString('en-US')}</td>
+                                            <td className={`px-6 py-4 whitespace-nowrap text-sm ${themeClasses.text}`}>{entry.notes}</td>
+                                        </tr>
+                                    );
+                                })}
+                            </tbody>
+                        </table>
+                    </div>
+                </Card>
+            )}
+        </div>
+    );
+};
+
+// --- LEAVE MANAGEMENT ---
+
+const LeaveManagement = ({ employees, db, getPath, themeClasses, Card, Button, setModal, userRole }) => {
+    const [leaveRequests, setLeaveRequests] = useState([]);
+    const [isApplying, setIsApplying] = useState(false);
+    const [newRequest, setNewRequest] = useState({ employeeId: '', type: 'Casual', startDate: '', endDate: '', reason: '' });
+
+    // Listener for Leave Requests
+    useEffect(() => {
+        if (!db) return;
+        let q = query(collection(db, getPath('hr_leave_requests')), orderBy('startDate', 'desc'));
+
+        const unsubscribe = onSnapshot(q, (snapshot) => {
+            const requests = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+            setLeaveRequests(requests);
+        }, (error) => console.error("Leave fetch error:", error));
+
+        return () => unsubscribe();
+    }, [db]);
+
+    const handleApplyLeave = async (e) => {
+        e.preventDefault();
+        const { employeeId, type, startDate, endDate, reason } = newRequest;
+
+        if (!employeeId || !type || !startDate || !endDate || !reason) {
+            setModal({ isOpen: true, title: 'Ghalti', message: 'Kripya sab fields bharin.' });
+            return;
+        }
+
+        const start = new Date(startDate);
+        const end = new Date(endDate);
+        if (start > end) {
+            setModal({ isOpen: true, title: 'Ghalti', message: 'End Date, Start Date se pehle nahi ho sakti.' });
+            return;
+        }
+
+        try {
+            await addDoc(collection(db, getPath('hr_leave_requests')), {
+                employeeId: employeeId,
+                type: type,
+                startDate: Timestamp.fromDate(start),
+                endDate: Timestamp.fromDate(end),
+                reason: reason,
+                status: 'Pending',
+                appliedAt: Timestamp.now(),
+            });
+
+            setModal({ isOpen: true, title: 'Kamyab', message: 'Leave request bhej di gayi hai.' });
+            setIsApplying(false);
+            setNewRequest({ employeeId: '', type: 'Casual', startDate: '', endDate: '', reason: '' });
+        } catch (error) {
+            setModal({ isOpen: true, title: 'Database Error', message: `Request bhejte waqt masla aaya: ${error.message}` });
+        }
+    };
+
+    const handleAction = async (id, status) => {
+        try {
+            await updateDoc(doc(db, getPath('hr_leave_requests', id)), {
+                status: status,
+                reviewedAt: Timestamp.now(),
+            });
+            setModal({ isOpen: true, title: 'Kamyab', message: `Leave request ${status} ho gayi.` });
+        } catch (error) {
+            setModal({ isOpen: true, title: 'Database Error', message: `Action perform karte waqt masla aaya: ${error.message}` });
+        }
+    };
+    
+    // Sort employees list for the dropdown
+    const sortedEmployees = useMemo(() => {
+        return [...employees].sort((a, b) => a.employeeId.localeCompare(b.employeeId));
+    }, [employees]);
+
+
+    return (
+        <div className="space-y-8">
+            <h1 className={`text-4xl font-bold ${themeClasses.text}`}>Leave Management (Alt + L)</h1>
+
+            {/* Apply Leave Form */}
+            {isApplying ? (
+                <Card title="Nayi Chutti (Leave) Ki Application">
+                    <form onSubmit={handleApplyLeave} className="space-y-4">
+                        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                            <SelectField label="Employee ID" value={newRequest.employeeId} options={sortedEmployees.map(e => e.employeeId)} onChange={(e) => setNewRequest({ ...newRequest, employeeId: e.target.value })} themeClasses={themeClasses} required />
+                            <SelectField label="Leave Type" value={newRequest.type} options={['Casual', 'Sick', 'Annual', 'Unpaid']} onChange={(e) => setNewRequest({ ...newRequest, type: e.target.value })} themeClasses={themeClasses} required />
+                            <InputField label="Start Date" type="date" value={newRequest.startDate} onChange={(e) => setNewRequest({ ...newRequest, startDate: e.target.value })} themeClasses={themeClasses} required />
+                            <InputField label="End Date" type="date" value={newRequest.endDate} onChange={(e) => setNewRequest({ ...newRequest, endDate: e.target.value })} themeClasses={themeClasses} required />
+                        </div>
+                        <label className="block">
+                            <span className={`text-sm font-medium ${themeClasses.text}`}>Wajah (Reason)</span>
+                            <textarea value={newRequest.reason} onChange={(e) => setNewRequest({ ...newRequest, reason: e.target.value })} rows="3" className={`mt-1 block w-full p-2 rounded-lg ${themeClasses.cardBg} ${themeClasses.text} ${themeClasses.border} border shadow-sm focus:ring-indigo-500 focus:border-indigo-500`} required />
+                        </label>
+                        <div className="flex gap-4 pt-4">
+                            <Button type="submit" className="bg-green-600 hover:bg-green-500">
+                                Request Bhejein
+                            </Button>
+                            <Button onClick={() => setIsApplying(false)} className="bg-red-600 hover:bg-red-500">
+                                Cancel
+                            </Button>
+                        </div>
+                    </form>
+                </Card>
+            ) : (
+                <Card title={`Leave Requests: ${leaveRequests.length}`}>
+                    <Button onClick={() => setIsApplying(true)} className="mb-4">
+                        + Nayi Leave Application
+                    </Button>
+                    <div className="overflow-x-auto">
+                        <table className={`min-w-full divide-y ${themeClasses.border}`}>
+                            <thead>
+                                <tr className={`${themeClasses.cardBg} text-left text-xs font-semibold uppercase tracking-wider ${themeClasses.textSecondary}`}>
+                                    <th className="px-6 py-3">ID</th>
+                                    <th className="px-6 py-3">Naam</th>
+                                    <th className="px-6 py-3">Type</th>
+                                    <th className="px-6 py-3">Dates</th>
+                                    <th className="px-6 py-3">Status</th>
+                                    {userRole !== 'Employee' && <th className="px-6 py-3">Action</th>}
+                                </tr>
+                            </thead>
+                            <tbody className={`divide-y ${themeClasses.border}`}>
+                                {leaveRequests.map((req) => {
+                                    const emp = employees.find(e => e.employeeId === req.employeeId) || {};
+                                    const statusColor = req.status === 'Pending' ? 'text-yellow-400' : req.status === 'Approved' ? 'text-green-400' : 'text-red-400';
+                                    return (
+                                        <tr key={req.id} className={`${themeClasses.cardBg} hover:bg-slate-700/50`}>
+                                            <td className={`px-6 py-4 whitespace-nowrap text-sm font-medium ${themeClasses.text}`}>{req.employeeId}</td>
+                                            <td className={`px-6 py-4 whitespace-nowrap text-sm ${themeClasses.text}`}>{emp.firstName || req.employeeId}</td>
+                                            <td className={`px-6 py-4 whitespace-nowrap text-sm ${themeClasses.text}`}>{req.type}</td>
+                                            <td className={`px-6 py-4 whitespace-nowrap text-sm ${themeClasses.text}`}>{req.startDate.toDate().toLocaleDateString()} - {req.endDate.toDate().toLocaleDateString()}</td>
+                                            <td className={`px-6 py-4 whitespace-nowrap text-sm font-semibold ${statusColor}`}>{req.status}</td>
+                                            {userRole !== 'Employee' && (
+                                                <td className="px-6 py-4 whitespace-nowrap text-sm flex gap-2">
+                                                    {req.status === 'Pending' && (
+                                                        <>
+                                                            <button onClick={() => handleAction(req.id, 'Approved')} className="text-green-400 hover:text-green-600">Manzoor</button>
+                                                            <button onClick={() => handleAction(req.id, 'Rejected')} className="text-red-400 hover:text-red-600">Rad</button>
+                                                        </>
+                                                    )}
+                                                </td>
+                                            )}
+                                        </tr>
+                                    );
+                                })}
+                            </tbody>
+                        </table>
+                    </div>
+                </Card>
+            )}
+        </div>
+    );
+};
+
+// --- ASSET MANAGEMENT ---
+
+const AssetManagement = ({ employees, assets, db, getPath, themeClasses, Card, Button, setModal }) => {
+    const [isAdding, setIsAdding] = useState(false);
+    const [currentAsset, setCurrentAsset] = useState({});
+
+    const handleSaveAsset = async (e) => {
+        e.preventDefault();
+        const { id, assetName, serialNumber, assignedTo } = currentAsset;
+
+        if (!assetName || !serialNumber) {
+            setModal({ isOpen: true, title: 'Ghalti', message: 'Asset Name aur Serial Number zaroori hain.' });
+            return;
+        }
+
+        const assetData = {
+            assetName,
+            serialNumber,
+            assignedTo: assignedTo || null,
+            lastUpdated: Timestamp.now(),
+        };
+
+        try {
+            if (id) {
+                await updateDoc(doc(db, getPath('hr_assets', id)), assetData);
+            } else {
+                await addDoc(collection(db, getPath('hr_assets')), assetData);
+            }
+            setModal({ isOpen: true, title: 'Kamyab', message: `Asset ${assetName} successfully save ho gaya.` });
+            setIsAdding(false);
+            setCurrentAsset({});
+        } catch (error) {
+            setModal({ isOpen: true, title: 'Database Error', message: `Asset save karte waqt masla aaya: ${error.message}` });
+        }
+    };
+
+    const handleEditAsset = (asset) => {
+        setCurrentAsset(asset);
+        setIsAdding(true);
+    };
+
+    const handleDeleteAsset = async (id, name) => {
+        if (!window.confirm(`Kya aap waqai ${name} ko delete karna chahte hain?`)) return;
+        try {
+            await deleteDoc(doc(db, getPath('hr_assets', id)));
+            setModal({ isOpen: true, title: 'Delete Kamyab', message: `${name} record se hata diya gaya.` });
+        } catch (error) {
+             setModal({ isOpen: true, title: 'Database Error', message: `Delete karte waqt masla aaya: ${error.message}` });
+        }
+    };
+
+    const AssetForm = () => (
+        <Card title={currentAsset.id ? `Edit Asset: ${currentAsset.assetName}` : "Naya Asset Add Karein"}>
+            <form onSubmit={handleSaveAsset} className="space-y-4">
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                    <InputField label="Asset Name (e.g., Laptop, Phone)" value={currentAsset.assetName || ''} onChange={(e) => setCurrentAsset({ ...currentAsset, assetName: e.target.value })} themeClasses={themeClasses} required />
+                    <InputField label="Serial Number / Tag" value={currentAsset.serialNumber || ''} onChange={(e) => setCurrentAsset({ ...currentAsset, serialNumber: e.target.value })} themeClasses={themeClasses} required />
+                    <SelectField
+                        label="Assigned To (Employee ID)"
+                        value={currentAsset.assignedTo || ''}
+                        options={employees.map(e => e.employeeId)}
+                        onChange={(e) => setCurrentAsset({ ...currentAsset, assignedTo: e.target.value })}
+                        themeClasses={themeClasses}
+                    />
+                </div>
+                <div className="flex gap-4 pt-4">
+                    <Button type="submit" className="bg-green-600 hover:bg-green-500">
+                        {currentAsset.id ? "Update Asset" : "Save Asset"}
+                    </Button>
+                    <Button onClick={() => { setIsAdding(false); setCurrentAsset({}); }} className="bg-red-600 hover:bg-red-500">
+                        Cancel
+                    </Button>
+                </div>
+            </form>
+        </Card>
+    );
+
+    return (
+        <div className="space-y-8">
+            <h1 className={`text-4xl font-bold ${themeClasses.text}`}>Asset Management</h1>
+
+            {isAdding ? (
+                <AssetForm />
+            ) : (
+                <Card title={`Total Assets: ${assets.length}`}>
+                    <Button onClick={() => setIsAdding(true)} className="mb-4">
+                        + Naya Asset Add Karein
+                    </Button>
+                    <div className="overflow-x-auto">
+                        <table className={`min-w-full divide-y ${themeClasses.border}`}>
+                            <thead>
+                                <tr className={`${themeClasses.cardBg} text-left text-xs font-semibold uppercase tracking-wider ${themeClasses.textSecondary}`}>
+                                    <th className="px-6 py-3">Asset Name</th>
+                                    <th className="px-6 py-3">Serial No.</th>
+                                    <th className="px-6 py-3">Assigned To (ID)</th>
+                                    <th className="px-6 py-3">Actions</th>
+                                </tr>
+                            </thead>
+                            <tbody className={`divide-y ${themeClasses.border}`}>
+                                {assets.map((asset) => {
+                                    const assignedEmp = employees.find(e => e.employeeId === asset.assignedTo);
+                                    return (
+                                        <tr key={asset.id} className={`${themeClasses.cardBg} hover:bg-slate-700/50`}>
+                                            <td className={`px-6 py-4 whitespace-nowrap text-sm font-medium ${themeClasses.text}`}>{asset.assetName}</td>
+                                            <td className={`px-6 py-4 whitespace-nowrap text-sm ${themeClasses.text}`}>{asset.serialNumber}</td>
+                                            <td className={`px-6 py-4 whitespace-nowrap text-sm ${themeClasses.text}`}>
+                                                {asset.assignedTo ? `${asset.assignedTo} (${assignedEmp?.firstName || 'Unknown'})` : 'Unassigned'}
+                                            </td>
+                                            <td className="px-6 py-4 whitespace-nowrap text-sm font-medium flex gap-2">
+                                                <button onClick={() => handleEditAsset(asset)} className="text-indigo-400 hover:text-indigo-600">Edit</button>
+                                                <button onClick={() => handleDeleteAsset(asset.id, asset.assetName)} className="text-red-400 hover:text-red-600">Delete</button>
+                                            </td>
+                                        </tr>
+                                    );
+                                })}
+                            </tbody>
+                        </table>
+                    </div>
+                </Card>
+            )}
+        </div>
+    );
+};
+
+
+// --- SETTINGS PANEL (ADMIN ONLY) ---
+
+const SettingsPanel = ({ settings, db, themeClasses, Card, Button, setModal, setTheme }) => {
+    const [tempSettings, setTempSettings] = useState(settings);
+
+    useEffect(() => {
+        setTempSettings(settings);
+    }, [settings]);
+
+    const handleSaveSettings = async (e) => {
+        e.preventDefault();
+        try {
+            await setDoc(doc(db, `/artifacts/${appId}/public/data/hr_config`, 'payroll_rules'), {
+                ...tempSettings,
+                hourlyRate: parseFloat(tempSettings.hourlyRate),
+                workHoursPerDay: parseFloat(tempSettings.workHoursPerDay),
+                overtimeRateMultiplier: parseFloat(tempSettings.overtimeRateMultiplier),
+                lateComingGraceMinutes: parseInt(tempSettings.lateComingGraceMinutes),
+                lateComingDeductionRate: parseFloat(tempSettings.lateComingDeductionRate),
+                taxRate: parseFloat(tempSettings.taxRate),
+                pfDeduction: parseFloat(tempSettings.pfDeduction)
+            });
+            setModal({ isOpen: true, title: 'Kamyab', message: 'Settings save ho gayi hain. Payroll ab in rules ke mutabiq chalega.' });
+        } catch (error) {
+            setModal({ isOpen: true, title: 'Database Error', message: `Settings save karte waqt masla aaya: ${error.message}` });
+        }
+    };
+
+    return (
+        <div className="space-y-8">
+            <h1 className={`text-4xl font-bold ${themeClasses.text}`}>System Settings (Alt + S)</h1>
+
+            {/* Theme Settings */}
+            <Card title="Aesthetic Settings (Themes)">
+                <p className={themeClasses.textSecondary}>App ka rang (theme) tabdeel karein.</p>
+                <div className="flex gap-4 mt-4">
+                    <Button onClick={() => setTheme('dark')} className="bg-slate-700 hover:bg-slate-600">Dark Mode</Button>
+                    <Button onClick={() => setTheme('light')} className="bg-gray-200 text-gray-800 hover:bg-gray-300">Light Mode</Button>
+                    <Button onClick={() => setTheme('ocean')} className="bg-blue-600 hover:bg-blue-500">Ocean Blue</Button>
+                </div>
+            </Card>
+
+            {/* Payroll & Deduction Rules */}
+            <Card title="Payroll aur Deduction Rules">
+                <form onSubmit={handleSaveSettings} className="space-y-6">
+                    <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                        {/* Payroll Base */}
+                        <h3 className={`text-lg font-semibold col-span-full border-b pb-2 ${themeClasses.text}`}>Waqt aur Salary Base</h3>
+                        <InputField label="Standard Work Hours Per Day" type="number" value={tempSettings.workHoursPerDay || 8} onChange={(e) => setTempSettings({ ...tempSettings, workHoursPerDay: e.target.value })} themeClasses={themeClasses} required />
+                        <InputField label="Hourly Rate (Average)" type="number" value={tempSettings.hourlyRate || 200} onChange={(e) => setTempSettings({ ...tempSettings, hourlyRate: e.target.value })} themeClasses={themeClasses} required />
+                        <InputField label="Overtime Rate Multiplier" type="number" value={tempSettings.overtimeRateMultiplier || 1.5} onChange={(e) => setTempSettings({ ...tempSettings, overtimeRateMultiplier: e.target.value })} themeClasses={themeClasses} required />
+
+                        {/* Late Coming */}
+                        <h3 className={`text-lg font-semibold col-span-full border-b pb-2 ${themeClasses.text}`}>Late Coming Rules</h3>
+                        <InputField label="Grace Period (Mins)" type="number" value={tempSettings.lateComingGraceMinutes || 10} onChange={(e) => setTempSettings({ ...tempSettings, lateComingGraceMinutes: e.target.value })} themeClasses={themeClasses} required />
+                        <InputField label="Late Deduction Rate (e.g., 0.05 for 5%)" type="number" step="0.01" value={tempSettings.lateComingDeductionRate || 0.05} onChange={(e) => setTempSettings({ ...tempSettings, lateComingDeductionRate: e.target.value })} themeClasses={themeClasses} required />
+
+                        {/* Standard Deductions */}
+                        <h3 className={`text-lg font-semibold col-span-full border-b pb-2 ${themeClasses.text}`}>Standard Deductions</h3>
+                        <InputField label="Tax Rate (e.g., 0.10 for 10%)" type="number" step="0.01" value={tempSettings.taxRate || 0.10} onChange={(e) => setTempSettings({ ...tempSettings, taxRate: e.target.value })} themeClasses={themeClasses} required />
+                        <InputField label="PF/EOBI Deduction (e.g., 0.08 for 8%)" type="number" step="0.01" value={tempSettings.pfDeduction || 0.08} onChange={(e) => setTempSettings({ ...tempSettings, pfDeduction: e.target.value })} themeClasses={themeClasses} required />
+                    </div>
+
+                    <Button type="submit" className="bg-green-600 hover:bg-green-500 mt-6">
+                        Settings Save Karein
+                    </Button>
+                </form>
+            </Card>
+        </div>
+    );
+};
+
+// --- FINAL EXPORT ---
+
+export default App;
+
