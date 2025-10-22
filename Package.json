@@ -1,0 +1,13 @@
+{
+  "name": "vision-hr-app",
+  "version": "1.0.0",
+  "description": "Vision HR System for Web and Desktop",
+  "scripts": {
+    "build": "echo 'No build required for single file App.jsx' && exit 0"
+  },
+  "dependencies": {
+    "react": "18.2.0",
+    "react-dom": "18.2.0",
+    "firebase": "11.6.1"
+  }
+}
